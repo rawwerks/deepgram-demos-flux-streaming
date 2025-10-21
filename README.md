@@ -68,6 +68,7 @@ This demo will run in Chrome and Safari browsers only. No Firefox support.
 
 ### Silero VAD Behavior
 - Browser audio is gated by a Silero Voice Activity Detector running in WebAssembly; Deepgram sessions are only opened when the detector hears speech.
+- Starting the microphone immediately primes a FLUX session, so the first utterance is captured without waiting for WebSocket setup.
 - A ~600 ms pre-roll buffer is streamed before the first detected syllable so transcripts do not truncate leading words.
 - If the detector hears at least five seconds of silence, the browser closes the Deepgram WebSocket to avoid billing during idle time. A new session opens automatically the next time you speak.
 - Transcript turn indices are stitched across sessions so the conversation view remains continuous even though the underlying connections are short-lived.

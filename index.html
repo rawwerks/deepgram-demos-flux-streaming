@@ -586,6 +586,7 @@ small {
                 this.frameDurationMs = null;
                 this.frameLogCounter = 0;
                 this.textDecoder = typeof TextDecoder !== 'undefined' ? new TextDecoder() : null;
+                this.sessionHasSpoken = false;
 
                 this.silenceTimeoutMs = SILENCE_TIMEOUT_MS;
                 this.silenceTimer = null;
@@ -635,7 +636,7 @@ small {
                     model: 'flux-general-en',
                     sample_rate: '16000',
                     encoding: 'linear16',
-                    eot_threshold: this.elements.eotThreshold.value || '0.7'
+                    eot_threshold: this.elements.eotThreshold.value || '0.9'
                 });
 
                 const eagerEotThreshold = this.elements.eagerEotThreshold.value;
@@ -719,6 +720,8 @@ small {
 
                 this.ws = ws;
                 this.wsSessionId = sessionLabel;
+                this.sessionHasSpoken = false;
+                this.silenceElapsedMs = 0;
             }
 
             handleFluxOpen(event) {
@@ -730,6 +733,8 @@ small {
 
                 this.wsState = 'streaming';
                 this.streamedChunkCount = 0;
+                this.silenceElapsedMs = 0;
+                this.sessionHasSpoken = false;
 
                 const sessionLabel = this.wsSessionId ?? event.target.__fluxSessionId ?? this.sessionId;
                 this.updateStatus('connected', 'Streaming (speech detected)');
@@ -808,6 +813,7 @@ small {
                 this.wsSessionId = null;
                 this.pendingFrames = [];
                 this.currentPreSpeechSnapshot = null;
+                this.sessionHasSpoken = false;
 
                 if (this.lastGlobalTurnIndex >= this.turnOffset) {
                     this.turnOffset = this.lastGlobalTurnIndex + 1;
@@ -835,6 +841,7 @@ small {
                 this.wsSessionId = null;
                 this.pendingFrames = [];
                 this.currentPreSpeechSnapshot = null;
+                this.sessionHasSpoken = false;
 
                 this.updateStatus('disconnected', 'Connection error');
                 this.autoConnect = false;
@@ -856,6 +863,9 @@ small {
                     this.elements.stopStreamBtn.disabled = false;
 
                     this.log('🎤 Microphone capture with Silero VAD started');
+                    if (this.autoConnect) {
+                        this.ensureFluxSession();
+                    }
                 } catch (error) {
                     this.log(`❌ Microphone error: ${error.message}`);
                     this.vadListening = false;
@@ -924,6 +934,10 @@ small {
                 this.clearSilenceTimer();
                 this.log('🟢 VAD detected speech start');
 
+                if (!this.sessionHasSpoken) {
+                    this.sessionHasSpoken = true;
+                }
+
                 if (!this.autoConnect) {
                     this.log('⚠️ Connect to FLUX before speaking');
                     return;
@@ -957,7 +971,7 @@ small {
                 if (this.vadSpeechActive) {
                     this.silenceElapsedMs = 0;
                     this.streamFrame(frame);
-                } else if (this.wsState === 'streaming') {
+                } else if (this.wsState === 'streaming' && this.sessionHasSpoken) {
                     this.silenceElapsedMs += this.frameDurationMs;
                     if (this.silenceElapsedMs >= this.silenceTimeoutMs) {
                         this.log('⏹️ Silence timeout reached, closing FLUX session');
@@ -1059,6 +1073,7 @@ small {
 
             closeFluxSession(reason) {
                 this.clearSilenceTimer();
+                this.sessionHasSpoken = false;
 
                 if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
                     try {
@@ -1101,6 +1116,7 @@ small {
                 this.preSpeechFrames = [];
                 this.pendingFrames = [];
                 this.currentPreSpeechSnapshot = null;
+                this.sessionHasSpoken = false;
 
                 this.elements.startMicBtn.disabled = false;
                 this.elements.stopStreamBtn.disabled = true;
