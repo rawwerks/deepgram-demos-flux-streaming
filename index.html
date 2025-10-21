@@ -548,9 +548,11 @@ small {
 
     <script>
         const SILENCE_TIMEOUT_MS = 5000;
-        const PRE_SPEECH_BUFFER_MS = 800;
-        const SPEECH_START_THRESHOLD = 0.6;
-        const SPEECH_STOP_THRESHOLD = 0.45;
+        const PRE_SPEECH_BUFFER_MS = 600;
+        const SPEECH_START_THRESHOLD = 0.35;
+        const SPEECH_STOP_THRESHOLD = 0.25;
+        const MIN_SPEECH_MS = 120;
+        const REDEMPTION_MS = 1500;
         const ONNX_WASM_BASE_PATH = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
         const VAD_ASSET_BASE_PATH = 'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.27/dist/';
 
@@ -902,9 +904,9 @@ small {
                     onnxWASMBasePath: ONNX_WASM_BASE_PATH,
                     positiveSpeechThreshold: SPEECH_START_THRESHOLD,
                     negativeSpeechThreshold: SPEECH_STOP_THRESHOLD,
-                    minSpeechMs: 250,
+                    minSpeechMs: MIN_SPEECH_MS,
                     preSpeechPadMs: this.preSpeechMs,
-                    redemptionMs: 800,
+                    redemptionMs: REDEMPTION_MS,
                 });
 
                 this.log('✅ Silero VAD ready');
