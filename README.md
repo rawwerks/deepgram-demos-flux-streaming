@@ -17,6 +17,7 @@ This demo will run in Chrome and Safari browsers only. No Firefox support.
 - **⚡ Ultra-low latency** with model-integrated end-of-turn detection
 - **🎯 Smart turn detection** with configurable confidence thresholds
 - **🚀 WebSocket proxy server** with proper authentication
+- **🛑 Client-side VAD gating** using Silero WASM to automatically pause Deepgram sessions during silence
 - **📊 Live event monitoring** with detailed FLUX response logging
 - **🎨 Modern responsive UI** with real-time transcript display
 
@@ -64,6 +65,13 @@ This demo will run in Chrome and Safari browsers only. No Firefox support.
 2. **Start microphone**: Click "🎤 Start Microphone" and grant browser permissions
 3. **Speak clearly**: The app will show real-time transcription and turn events
 4. **Watch the magic**: Observe FLUX's turn detection and conversational flow
+
+### Silero VAD Behavior
+- Browser audio is gated by a Silero Voice Activity Detector running in WebAssembly; Deepgram sessions are only opened when the detector hears speech.
+- A one-second pre-roll buffer is streamed before the first detected syllable so transcripts do not truncate leading words.
+- If the detector hears at least five seconds of silence, the browser closes the Deepgram WebSocket to avoid billing during idle time. A new session opens automatically the next time you speak.
+- Transcript turn indices are stitched across sessions so the conversation view remains continuous even though the underlying connections are short-lived.
+- The VAD loads its ONNX and worklet assets from the jsDelivr CDN by default—bundle those files locally if you need the demo to work offline.
 
 ## ⚙️ Configuration Options
 

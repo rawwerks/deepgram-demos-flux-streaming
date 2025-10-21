@@ -4,6 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Deepgram FLUX API Demo</title>
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.27/dist/bundle.min.js"></script>
     <style>
 /* Deepgram Minimal Design System - FLUX Demo */
 :root {
@@ -545,16 +547,51 @@ small {
     </div>
 
     <script>
+        const SILENCE_TIMEOUT_MS = 5000;
+        const PRE_SPEECH_BUFFER_MS = 800;
+        const SPEECH_START_THRESHOLD = 0.6;
+        const SPEECH_STOP_THRESHOLD = 0.45;
+        const ONNX_WASM_BASE_PATH = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
+        const VAD_ASSET_BASE_PATH = 'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.27/dist/';
+
         class FluxDemo {
             constructor() {
                 this.ws = null;
-                this.audioContext = null;
+                this.wsState = 'idle';
+                this.wsSessionId = null;
+                this.autoConnect = false;
+
+                this.connectionParams = null;
+                this.connectionBasePath = '';
+
+                this.sessionId = 0;
+                this.turnOffset = 0;
+                this.lastGlobalTurnIndex = -1;
+
+                this.vad = null;
+                this.vadListening = false;
+                this.vadSpeechActive = false;
                 this.mediaStream = null;
-                this.processor = null;
                 this.isUsingMicrophone = false;
+
+                this.preSpeechMs = PRE_SPEECH_BUFFER_MS;
+                this.preSpeechFrames = [];
+                this.preSpeechFrameLimit = Math.ceil(this.preSpeechMs / 20);
+                this.currentPreSpeechSnapshot = null;
+
+                this.pendingFrames = [];
+                this.streamedChunkCount = 0;
+                this.frameDurationMs = null;
+                this.frameLogCounter = 0;
+                this.textDecoder = typeof TextDecoder !== 'undefined' ? new TextDecoder() : null;
+
+                this.silenceTimeoutMs = SILENCE_TIMEOUT_MS;
+                this.silenceTimer = null;
+                this.silenceElapsedMs = 0;
 
                 this.initializeElements();
                 this.setupEventListeners();
+                this.updateStatus('disconnected', 'Disconnected');
             }
 
             initializeElements() {
@@ -581,7 +618,7 @@ small {
             }
 
             toggleConnection() {
-                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                if (this.autoConnect) {
                     this.disconnect();
                 } else {
                     this.connect();
@@ -589,11 +626,8 @@ small {
             }
 
             connect() {
-                this.updateStatus('connecting', 'Connecting...');
                 this.elements.connectBtn.disabled = true;
 
-                // Build WebSocket URL with parameters for our local proxy
-                // Auto-detect if we're running under /flux-streaming path
                 const BASE_PATH = (location.pathname === '/flux-streaming' || location.pathname.startsWith('/flux-streaming/')) ? '/flux-streaming' : '';
                 const params = new URLSearchParams({
                     model: 'flux-general-en',
@@ -602,10 +636,9 @@ small {
                     eot_threshold: this.elements.eotThreshold.value || '0.7'
                 });
 
-                // Add eager eot threshold if specified
                 const eagerEotThreshold = this.elements.eagerEotThreshold.value;
                 if (eagerEotThreshold) {
-                    if (eagerEotThreshold > (this.elements.eotThreshold.value || 0.7)) {
+                    if (parseFloat(eagerEotThreshold) > parseFloat(this.elements.eotThreshold.value || '0.7')) {
                         this.log('❌ Eager End-of-Turn Threshold must be below End-of-Turn Threshold');
                         this.updateStatus('disconnected', 'Disconnected');
                         this.elements.connectBtn.disabled = false;
@@ -614,224 +647,467 @@ small {
                     params.append('eager_eot_threshold', eagerEotThreshold);
                 }
 
-                // Connect to our local WebSocket proxy server (same host, configured base path)
-                const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws';
-                const wsUrl = `${wsProtocol}://${location.host}${BASE_PATH}?${params.toString()}`;
-                this.log(`🔗 Connecting to: ${wsUrl}`);
-                this.ws = new WebSocket(wsUrl);
+                this.connectionParams = params;
+                this.connectionBasePath = BASE_PATH;
+                this.autoConnect = true;
 
-                this.ws.onopen = () => {
-                    this.log('✅ Connected to FLUX API via proxy server');
-                    this.updateStatus('connected', 'Connected to FLUX API');
-                    this.elements.connectBtn.textContent = 'Disconnect';
-                    this.elements.connectBtn.disabled = false;
-                    this.elements.startMicBtn.disabled = false;
-                };
+                this.elements.connectBtn.textContent = 'Disconnect';
+                this.elements.connectBtn.disabled = false;
+                this.elements.startMicBtn.disabled = false;
 
-                this.ws.onmessage = (event) => {
-                    try {
-                        const data = JSON.parse(event.data);
-                        this.log(`📨 Raw WebSocket message: ${event.data.substring(0, 200)}${event.data.length > 200 ? '...' : ''}`);
-                        this.handleFluxMessage(data);
-                    } catch (error) {
-                        this.log(`❌ Error parsing message: ${error.message}`);
-                        this.log(`📨 Raw message: ${event.data.substring(0, 100)}`);
-                    }
-                };
-
-                this.ws.onclose = (event) => {
-                    this.log(`WebSocket closed: ${event.code} - ${event.reason}`);
-                    this.updateStatus('disconnected', 'Disconnected');
-                    this.elements.connectBtn.textContent = 'Connect to FLUX';
-                    this.elements.connectBtn.disabled = false;
-                    this.elements.startMicBtn.disabled = true;
-                    this.elements.stopStreamBtn.disabled = true;
-                    this.stopAll();
-                };
-
-                this.ws.onerror = (error) => {
-                    this.log(`WebSocket error: ${error.message || 'Unknown error'}`);
-                    this.updateStatus('disconnected', 'Connection error');
-                    this.elements.connectBtn.disabled = false;
-                };
+                this.updateStatus('connected', 'Armed - waiting for speech');
+                this.log('✅ Ready to stream when speech is detected');
             }
 
             disconnect() {
-                if (this.ws) {
-                    this.stopAll();
-                    this.ws.close();
-                    this.ws = null;
+                this.autoConnect = false;
+                this.closeFluxSession('manual disconnect');
+                this.stopAll();
+
+                this.elements.connectBtn.textContent = 'Connect to FLUX';
+                this.elements.connectBtn.disabled = false;
+                this.elements.startMicBtn.disabled = true;
+                this.elements.stopStreamBtn.disabled = true;
+
+                this.updateStatus('disconnected', 'Disconnected');
+            }
+
+            buildWebSocketUrl() {
+                if (!this.connectionParams) {
+                    this.log('⚠️ Connect to FLUX before starting the microphone');
+                    return null;
+                }
+                const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws';
+                return `${wsProtocol}://${location.host}${this.connectionBasePath}?${this.connectionParams.toString()}`;
+            }
+
+            ensureFluxSession() {
+                if (!this.autoConnect) {
+                    return;
+                }
+                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                    this.flushPreSpeechSnapshot();
+                    return;
+                }
+                if (this.wsState === 'connecting') {
+                    return;
+                }
+
+                const wsUrl = this.buildWebSocketUrl();
+                if (!wsUrl) {
+                    return;
+                }
+
+                this.wsState = 'connecting';
+                this.sessionId += 1;
+                this.streamedChunkCount = 0;
+
+                const sessionLabel = this.sessionId;
+                this.log(`🔗 Opening FLUX session #${sessionLabel}: ${wsUrl}`);
+                this.updateStatus('connecting', 'Opening FLUX session...');
+
+                const ws = new WebSocket(wsUrl);
+                ws.binaryType = 'arraybuffer';
+                ws.__fluxSessionId = sessionLabel;
+
+                ws.onopen = (event) => this.handleFluxOpen(event);
+                ws.onmessage = (event) => this.handleFluxMessage(event);
+                ws.onclose = (event) => this.handleFluxClose(event);
+                ws.onerror = (event) => this.handleFluxError(event);
+
+                this.ws = ws;
+                this.wsSessionId = sessionLabel;
+            }
+
+            handleFluxOpen(event) {
+                if (!event || event.target !== this.ws) {
+                    const label = event?.target?.__fluxSessionId ?? '?';
+                    this.log(`ℹ️ Ignoring open event from stale session #${label}`);
+                    return;
+                }
+
+                this.wsState = 'streaming';
+                this.streamedChunkCount = 0;
+
+                const sessionLabel = this.wsSessionId ?? event.target.__fluxSessionId ?? this.sessionId;
+                this.updateStatus('connected', 'Streaming (speech detected)');
+                this.log(`✅ Connected to FLUX API (session #${sessionLabel})`);
+
+                this.flushPreSpeechSnapshot();
+                this.flushQueuedFrames();
+            }
+
+            handleFluxMessage(event) {
+                if (!event || event.target !== this.ws) {
+                    return;
+                }
+
+                const payload = event.data;
+                if (typeof payload === 'string') {
+                    this.processFluxPayload(payload);
+                } else if (payload instanceof ArrayBuffer) {
+                    const decoder = this.textDecoder || new TextDecoder();
+                    const text = decoder.decode(payload);
+                    this.processFluxPayload(text);
+                } else if (payload instanceof Blob) {
+                    payload.text()
+                        .then(text => this.processFluxPayload(text))
+                        .catch(err => this.log(`❌ Error reading message blob: ${err.message}`));
+                } else {
+                    this.log('⚠️ Received unsupported message type from FLUX');
                 }
             }
 
+            processFluxPayload(rawText) {
+                if (!rawText) {
+                    return;
+                }
+
+                const sessionLabel = this.wsSessionId ?? this.sessionId;
+                this.log(`📨 [Session #${sessionLabel}] Raw WebSocket message: ${rawText.substring(0, 200)}${rawText.length > 200 ? '...' : ''}`);
+
+                let parsed;
+                try {
+                    parsed = JSON.parse(rawText);
+                } catch (error) {
+                    this.log(`❌ Error parsing message: ${error.message}`);
+                    return;
+                }
+
+                const adjusted = { ...parsed };
+                if (typeof parsed.turn_index === 'number') {
+                    const globalTurn = this.turnOffset + parsed.turn_index;
+                    adjusted.turn_index = globalTurn;
+                    this.lastGlobalTurnIndex = Math.max(this.lastGlobalTurnIndex, globalTurn);
+                }
+
+                if (adjusted.type === 'TurnInfo') {
+                    this.updateTurnInfo(adjusted);
+
+                    if (adjusted.event === 'EndOfTurn' && !this.vadSpeechActive) {
+                        this.scheduleSilenceClose(1000);
+                    }
+                } else {
+                    this.log(`📨 [Session #${sessionLabel}] Message type: ${adjusted.type || 'unknown'}`);
+                }
+            }
+
+            handleFluxClose(event) {
+                const sessionLabel = event?.target?.__fluxSessionId ?? this.wsSessionId ?? '?';
+
+                if (!event || event.target !== this.ws) {
+                    this.log(`ℹ️ Session #${sessionLabel} closed (stale connection)`);
+                    return;
+                }
+
+                this.log(`WebSocket closed (session #${sessionLabel}): ${event.code} - ${event.reason || 'No reason provided'}`);
+                this.wsState = 'idle';
+                this.ws = null;
+                this.wsSessionId = null;
+                this.pendingFrames = [];
+                this.currentPreSpeechSnapshot = null;
+
+                if (this.lastGlobalTurnIndex >= this.turnOffset) {
+                    this.turnOffset = this.lastGlobalTurnIndex + 1;
+                }
+
+                if (this.autoConnect) {
+                    this.updateStatus('connected', 'Armed - waiting for speech');
+                } else {
+                    this.updateStatus('disconnected', 'Disconnected');
+                }
+            }
+
+            handleFluxError(event) {
+                const sessionLabel = event?.target?.__fluxSessionId ?? this.wsSessionId ?? '?';
+
+                if (!event || event.target !== this.ws) {
+                    this.log(`ℹ️ Session #${sessionLabel} received error after being replaced`);
+                    return;
+                }
+
+                const message = event?.message || event?.error?.message || 'Unknown error';
+                this.log(`WebSocket error (session #${sessionLabel}): ${message}`);
+                this.wsState = 'idle';
+                this.ws = null;
+                this.wsSessionId = null;
+                this.pendingFrames = [];
+                this.currentPreSpeechSnapshot = null;
+
+                this.updateStatus('disconnected', 'Connection error');
+                this.autoConnect = false;
+                this.elements.connectBtn.textContent = 'Connect to FLUX';
+                this.elements.startMicBtn.disabled = true;
+            }
 
             async startMicrophone() {
-                if (this.isUsingMicrophone) return;
-
+                if (this.vadListening) {
+                    return;
+                }
                 try {
-                    this.log('🎤 Starting FLUX transcription with Linear16 PCM...');
-                    this.log('⚠️  FLUX API requires raw PCM data, not compressed audio formats');
-
-                    // Request microphone access with specific constraints for FLUX
-                    const stream = await navigator.mediaDevices.getUserMedia({
-                        audio: {
-                            sampleRate: 16000,
-                            channelCount: 1,
-                            echoCancellation: false,  // Disable processing for cleaner PCM
-                            noiseSuppression: false,
-                            autoGainControl: false
-                        }
-                    });
-
-                    this.log('✅ Microphone access granted');
+                    await this.ensureVad();
+                    await this.vad.start();
+                    this.vadListening = true;
                     this.isUsingMicrophone = true;
+
                     this.elements.startMicBtn.disabled = true;
                     this.elements.stopStreamBtn.disabled = false;
-                    this.mediaStream = stream;
 
-                    // Create audio context at exactly 16kHz for FLUX
-                    this.audioContext = new (window.AudioContext || window.webkitAudioContext)({
-                        sampleRate: 16000
-                    });
-
-                    this.log(`🔧 Audio context sample rate: ${this.audioContext.sampleRate}Hz`);
-
-                    const source = this.audioContext.createMediaStreamSource(stream);
-
-                    // Use 1024 samples (64ms at 16kHz) - must be power of 2 for createScriptProcessor
-                    const bufferSize = 1024;
-                    this.processor = this.audioContext.createScriptProcessor(bufferSize, 1, 1);
-
-                    let chunkCount = 0;
-                    let lastLogTime = 0;
-
-                    this.processor.onaudioprocess = (event) => {
-                        chunkCount++;
-                        const now = Date.now();
-
-                        // Log every 2 seconds to avoid spam
-                        if (now - lastLogTime > 2000) {
-                            this.log(`🔊 Audio processing: ${chunkCount} chunks processed, WebSocket: ${this.ws ? this.ws.readyState : 'null'}`);
-                            lastLogTime = now;
-                        }
-
-                        if (this.isUsingMicrophone && this.ws && this.ws.readyState === WebSocket.OPEN) {
-                            const inputData = event.inputBuffer.getChannelData(0);
-
-                            // Check if we have actual audio signal
-                            let hasSignal = false;
-                            let maxAmplitude = 0;
-                            for (let i = 0; i < inputData.length; i++) {
-                                const abs = Math.abs(inputData[i]);
-                                if (abs > maxAmplitude) maxAmplitude = abs;
-                                if (abs > 0.001) hasSignal = true; // Threshold for detecting audio
-                            }
-
-                            // Log audio level periodically
-                            if (chunkCount % 32 === 0) { // Every ~2 seconds at 64ms chunks
-                                this.log(`🎵 Audio level: max=${(maxAmplitude * 100).toFixed(1)}%, signal=${hasSignal ? 'YES' : 'SILENT'}`);
-                            }
-
-                            // Convert Float32 to Int16 (Linear16 PCM format for FLUX)
-                            const int16Array = new Int16Array(inputData.length);
-                            for (let i = 0; i < inputData.length; i++) {
-                                // Clamp and convert to 16-bit signed integer
-                                const clampedValue = Math.max(-1, Math.min(1, inputData[i]));
-                                int16Array[i] = Math.round(clampedValue * 32767);
-                            }
-
-                            // Log first few successful sends
-                            if (chunkCount <= 5) {
-                                this.log(`📤 Sending chunk ${chunkCount}: ${int16Array.length} samples, ${int16Array.buffer.byteLength} bytes`);
-                            }
-
-                            // Send Linear16 PCM data to FLUX API
-                            this.ws.send(int16Array.buffer);
-                        } else {
-                            if (chunkCount <= 3) {
-                                this.log(`❌ Cannot send audio: mic=${this.isUsingMicrophone}, ws=${this.ws ? 'exists' : 'null'}, readyState=${this.ws ? this.ws.readyState : 'n/a'}`);
-                            }
-                        }
-                    };
-
-                    source.connect(this.processor);
-                    this.processor.connect(this.audioContext.destination);
-
-                    this.log('🎤 Linear16 PCM streaming started - speak now!');
-                    this.log(`📊 Sending ${bufferSize} samples (${(bufferSize/16000*1000).toFixed(0)}ms) per chunk`);
-
+                    this.log('🎤 Microphone capture with Silero VAD started');
                 } catch (error) {
                     this.log(`❌ Microphone error: ${error.message}`);
+                    this.vadListening = false;
                     this.isUsingMicrophone = false;
                     this.elements.startMicBtn.disabled = false;
                     this.elements.stopStreamBtn.disabled = true;
+                }
+            }
+
+            async ensureVad() {
+                if (this.vad) {
+                    return this.vad;
+                }
+                if (!window.vad || !window.vad.MicVAD) {
+                    throw new Error('Silero VAD library failed to load');
+                }
+
+                this.log('⏳ Loading Silero VAD (WebAssembly)...');
+
+                if (window.ort?.env?.wasm) {
+                    window.ort.env.wasm.numThreads = 1;
+                    window.ort.env.wasm.simd = true;
+                    window.ort.env.wasm.wasmPaths = ONNX_WASM_BASE_PATH;
+                }
+
+                this.vad = await window.vad.MicVAD.new({
+                    onSpeechStart: () => this.handleVadSpeechStart(),
+                    onSpeechEnd: () => this.handleVadSpeechEnd(),
+                    onFrameProcessed: (probabilities, frame) => this.handleVadFrame(probabilities, frame),
+                    getStream: async () => {
+                        this.mediaStream = await navigator.mediaDevices.getUserMedia({
+                            audio: {
+                                sampleRate: 16000,
+                                channelCount: 1,
+                                echoCancellation: false,
+                                noiseSuppression: false,
+                                autoGainControl: false
+                            }
+                        });
+                        return this.mediaStream;
+                    },
+                    pauseStream: async (stream) => {
+                        stream.getTracks().forEach(track => track.stop());
+                    },
+                    baseAssetPath: VAD_ASSET_BASE_PATH,
+                    onnxWASMBasePath: ONNX_WASM_BASE_PATH,
+                    positiveSpeechThreshold: SPEECH_START_THRESHOLD,
+                    negativeSpeechThreshold: SPEECH_STOP_THRESHOLD,
+                    minSpeechMs: 250,
+                    preSpeechPadMs: this.preSpeechMs,
+                    redemptionMs: 800,
+                });
+
+                this.log('✅ Silero VAD ready');
+                return this.vad;
+            }
+
+            handleVadSpeechStart() {
+                this.vadSpeechActive = true;
+                this.silenceElapsedMs = 0;
+                this.frameLogCounter = 0;
+                this.pendingFrames = [];
+                this.streamedChunkCount = 0;
+                this.currentPreSpeechSnapshot = this.preSpeechFrames.map(frame => frame.slice());
+
+                this.clearSilenceTimer();
+                this.log('🟢 VAD detected speech start');
+
+                if (!this.autoConnect) {
+                    this.log('⚠️ Connect to FLUX before speaking');
+                    return;
+                }
+
+                this.ensureFluxSession();
+            }
+
+            handleVadSpeechEnd() {
+                this.vadSpeechActive = false;
+                this.log('🔴 VAD detected speech end');
+
+                if (this.wsState === 'streaming') {
+                    this.scheduleSilenceClose();
+                }
+            }
+
+            handleVadFrame(probabilities, frame) {
+                if (!this.vadListening) {
+                    return;
+                }
+
+                if (!this.frameDurationMs) {
+                    this.frameDurationMs = Math.max(1, Math.round((frame.length / 16000) * 1000));
+                    this.preSpeechFrameLimit = Math.max(1, Math.ceil(this.preSpeechMs / this.frameDurationMs));
+                    this.log(`🧠 VAD frame duration ~${this.frameDurationMs}ms (${this.preSpeechFrameLimit} frames pre-roll)`);
+                }
+
+                this.enqueuePreSpeechFrame(frame);
+
+                if (this.vadSpeechActive) {
+                    this.silenceElapsedMs = 0;
+                    this.streamFrame(frame);
+                } else if (this.wsState === 'streaming') {
+                    this.silenceElapsedMs += this.frameDurationMs;
+                    if (this.silenceElapsedMs >= this.silenceTimeoutMs) {
+                        this.log('⏹️ Silence timeout reached, closing FLUX session');
+                        this.closeFluxSession('silence timeout');
+                    }
+                }
+
+                this.frameLogCounter += 1;
+                if (this.frameLogCounter % 40 === 0) {
+                    let maxAmplitude = 0;
+                    for (let i = 0; i < frame.length; i++) {
+                        const abs = Math.abs(frame[i]);
+                        if (abs > maxAmplitude) maxAmplitude = abs;
+                    }
+                    this.log(`🎵 Audio level: max=${(maxAmplitude * 100).toFixed(1)}%, speech=${this.vadSpeechActive ? 'YES' : 'NO'} (speech prob=${probabilities.isSpeech.toFixed(2)})`);
+                }
+            }
+
+            enqueuePreSpeechFrame(frame) {
+                this.preSpeechFrames.push(new Float32Array(frame));
+                if (this.preSpeechFrames.length > this.preSpeechFrameLimit) {
+                    this.preSpeechFrames.shift();
+                }
+            }
+
+            streamFrame(frame) {
+                const int16 = this.floatToInt16(frame);
+
+                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                    this.ws.send(int16.buffer);
+                    this.streamedChunkCount += 1;
+                    if (this.streamedChunkCount <= 5) {
+                        this.log(`📤 Sending chunk ${this.streamedChunkCount}: ${int16.length} samples (${(int16.length / 16000 * 1000).toFixed(0)}ms)`);
+                    }
+                } else {
+                    this.pendingFrames.push(int16);
+                }
+            }
+
+            flushQueuedFrames() {
+                if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+                    return;
+                }
+                if (this.pendingFrames.length > 0) {
+                    this.log(`📤 Flushing ${this.pendingFrames.length} buffered chunks`);
+                }
+                while (this.pendingFrames.length) {
+                    const frame = this.pendingFrames.shift();
+                    this.ws.send(frame.buffer);
+                    this.streamedChunkCount += 1;
+                }
+            }
+
+            flushPreSpeechSnapshot() {
+                if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+                    return;
+                }
+                if (!this.currentPreSpeechSnapshot || this.currentPreSpeechSnapshot.length === 0) {
+                    return;
+                }
+
+                const approxMs = this.frameDurationMs ? this.currentPreSpeechSnapshot.length * this.frameDurationMs : this.preSpeechMs;
+                this.log(`📼 Sending ${this.currentPreSpeechSnapshot.length} pre-speech frames (~${approxMs}ms context)`);
+
+                for (const frame of this.currentPreSpeechSnapshot) {
+                    const int16 = this.floatToInt16(frame);
+                    this.ws.send(int16.buffer);
+                    this.streamedChunkCount += 1;
+                }
+
+                this.currentPreSpeechSnapshot = null;
+            }
+
+            floatToInt16(float32Array) {
+                const int16Array = new Int16Array(float32Array.length);
+                for (let i = 0; i < float32Array.length; i++) {
+                    const clampedValue = Math.max(-1, Math.min(1, float32Array[i]));
+                    int16Array[i] = Math.round(clampedValue * 32767);
+                }
+                return int16Array;
+            }
+
+            scheduleSilenceClose(delayMs = this.silenceTimeoutMs) {
+                this.clearSilenceTimer();
+                this.silenceTimer = setTimeout(() => {
+                    if (!this.vadSpeechActive) {
+                        this.log('⏹️ Closing FLUX session after sustained silence');
+                        this.closeFluxSession('silence timeout');
+                    }
+                }, delayMs);
+            }
+
+            clearSilenceTimer() {
+                if (this.silenceTimer) {
+                    clearTimeout(this.silenceTimer);
+                    this.silenceTimer = null;
+                }
+            }
+
+            closeFluxSession(reason) {
+                this.clearSilenceTimer();
+
+                if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+                    try {
+                        const sessionLabel = this.ws.__fluxSessionId ?? this.wsSessionId ?? this.sessionId;
+                        this.log(`⏹️ Requesting FLUX session #${sessionLabel} close (${reason || 'no reason'})`);
+                        this.ws.close(1000, reason);
+                        this.wsState = 'closing';
+                    } catch (error) {
+                        this.log(`⚠️ Error closing WebSocket: ${error.message}`);
+                    }
+                }
+
+                if (this.autoConnect) {
+                    this.updateStatus('connected', 'Armed - waiting for speech');
+                } else {
+                    this.updateStatus('disconnected', 'Disconnected');
                 }
             }
 
             stopAll() {
-                // Stop microphone
-                if (this.isUsingMicrophone) {
-                    this.log('🎤 Stopping microphone');
-                    this.isUsingMicrophone = false;
+                this.clearSilenceTimer();
 
-                    if (this.processor) {
-                        this.processor.disconnect();
-                        this.processor = null;
-                    }
-
-                    if (this.audioContext && this.audioContext.state !== 'closed') {
-                        this.audioContext.close();
-                        this.audioContext = null;
-                    }
-
-                    if (this.mediaStream) {
-                        this.mediaStream.getTracks().forEach(track => track.stop());
-                        this.mediaStream = null;
+                if (this.vad && this.vadListening) {
+                    try {
+                        this.vad.pause();
+                    } catch (error) {
+                        this.log(`⚠️ Error pausing VAD: ${error.message}`);
                     }
                 }
 
-                // Reset button states
+                if (this.mediaStream) {
+                    this.mediaStream.getTracks().forEach(track => track.stop());
+                    this.mediaStream = null;
+                }
+
+                this.vadListening = false;
+                this.vadSpeechActive = false;
+                this.isUsingMicrophone = false;
+                this.frameDurationMs = null;
+                this.preSpeechFrames = [];
+                this.pendingFrames = [];
+                this.currentPreSpeechSnapshot = null;
+
                 this.elements.startMicBtn.disabled = false;
                 this.elements.stopStreamBtn.disabled = true;
-            }
 
-            // Backward compatibility
-            stopAudioStream() {
-                this.stopAll();
-            }
-
-            handleFluxMessage(data) {
-                this.log(`Received: ${JSON.stringify(data, null, 2)}`);
-
-                // Handle TurnInfo messages (FLUX API responses)
-                if (data.type === 'TurnInfo') {
-                    this.updateTurnInfo(data);
-
-                    switch(data.event) {
-                        case 'StartOfTurn':
-                            this.log('🟢 User started speaking');
-                            break;
-                        case 'EagerEndOfTurn':
-                            this.log('🟡 Eager end of turn - medium confidence turn end');
-                            break;
-                        case 'TurnResumed':
-                            this.log('🔄 Turn resumed after eager end of turn');
-                            break;
-                        case 'EndOfTurn':
-                            this.log('🔴 End of turn - high confidence');
-                            break;
-                        case 'Update':
-                            this.log('📝 Transcript update');
-                            break;
-                    }
-        } else {
-                    // Log other message types for debugging
-                    this.log(`📨 Message type: ${data.type || 'unknown'}`);
-                }
+                this.closeFluxSession('microphone stopped');
             }
 
             updateTurnInfo(data) {
-                this.elements.turnIndex.textContent = data.turn_index || '-';
+                this.elements.turnIndex.textContent = data.turn_index ?? '-';
                 this.elements.currentEvent.textContent = data.event || '-';
                 this.elements.eotConfidence.textContent =
                     data.end_of_turn_confidence ? data.end_of_turn_confidence.toFixed(2) : '-';
@@ -839,7 +1115,9 @@ small {
                     data.audio_window_start !== undefined && data.audio_window_end !== undefined
                         ? `${data.audio_window_start.toFixed(1)}s - ${data.audio_window_end.toFixed(1)}s`
                         : '-';
-                this.elements.currentTranscript.textContent = data.transcript || this.elements.currentTranscript.textContent;
+                if (data.transcript) {
+                    this.elements.currentTranscript.textContent = data.transcript;
+                }
             }
 
             updateStatus(type, message) {
@@ -855,7 +1133,6 @@ small {
             }
         }
 
-        // Initialize the demo when page loads
         window.addEventListener('DOMContentLoaded', () => {
             new FluxDemo();
         });
